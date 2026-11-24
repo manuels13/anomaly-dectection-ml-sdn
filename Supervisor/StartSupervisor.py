@@ -21,9 +21,12 @@ CSV_PATTERN = 'Flow_*.pcap_Flow.csv'
 POLL_SECONDS = 1
 
 # Reaction to anomalies: each anomalous flow adds ANOMALY_SCORE to the source's status,
-# which decays by SCORE_DECAY_PER_MINUTE while no anomalies arrive. At BLOCK_THRESHOLD the
-# source is blocked on its switch for BLOCK_SECONDS.
+# which decays by SCORE_DECAY_PER_MINUTE (applied whenever a flow from that source is processed). At BLOCK_THRESHOLD the
+# source is blocked on its switch for BLOCK_SECONDS. The score is capped at MAX_SCORE, so a
+# source falls back below the threshold (MAX_SCORE - BLOCK_THRESHOLD) / SCORE_DECAY_PER_MINUTE
+# minutes after its last anomaly instead of days after a long attack.
 ANOMALY_SCORE = 30
+MAX_SCORE = 200
 SCORE_DECAY_PER_MINUTE = 10
 BLOCK_THRESHOLD = 100
 BLOCK_SECONDS = 1800
@@ -61,7 +64,7 @@ def initiateSpvs():
     idsapp = MLInitiater(MODEL_FILEPATH, DATA_PIPELINE_FILEPATH)
 
     processed = set()
-    last_anomaly = {}   # ip -> time of its last anomaly, for the score decay
+    decayed_until = {}  # ip -> time up to which its score decay has been applied
     blocked_until = {}  # ip -> time its block rule expires
     while True:
         new_files = set(glob.glob(os.path.join(CSVFILEPATH, CSV_PATTERN))) - processed
@@ -76,6 +79,7 @@ def initiateSpvs():
             if len(df) == 0:
                 continue
             predictions = idsapp.predict(df)
+            skipped_blocked = 0
             for i in range(len(df)):
                 ip_src = str(df.iloc[i,1])
                 if DB.DBconfig_query(ip_src)[0] is None:
@@ -84,19 +88,27 @@ def initiateSpvs():
                 if df.index[i] not in predictions.index:
                     log.info("Ignored flow with NaN or infinite features: " + ip_src + " -> " + str(df.iloc[i,3]))
                     continue
+                # Apply the decay on every flow, so the stored score goes down over time
+                # and not only when the next anomaly arrives
+                now = time.time()
+                since = decayed_until.setdefault(ip_src, now)
+                decay = int((now - since) / 60 * SCORE_DECAY_PER_MINUTE)
+                if decay > 0:
+                    DB.DBconfig_decrease_status(ip_src, decay)
+                    decayed_until[ip_src] = since + decay * 60 / SCORE_DECAY_PER_MINUTE
+                # A flow from or to a blocked host cannot complete (the switch drops that host's
+                # packets), and the model flags one-way flows as anomalies. Scoring them would keep
+                # the blocked host at the maximum and block every host that tries to reach it.
+                ip_dst = str(df.iloc[i,3])
+                if now < blocked_until.get(ip_src, 0) or now < blocked_until.get(ip_dst, 0):
+                    skipped_blocked += 1
+                    continue
                 if predictions[df.index[i]] == PredictLabels.ANOMALY.value:
-                    now = time.time()
-                    decay = int((now - last_anomaly.get(ip_src, now)) / 60 * SCORE_DECAY_PER_MINUTE)
-                    if decay > 0:
-                        DB.DBconfig_decrease_status(ip_src, decay)
-                    last_anomaly[ip_src] = now
-                    DB.DBconfig_update_status(ip_src, increase=ANOMALY_SCORE)
+                    DB.DBconfig_update_status(ip_src, increase=ANOMALY_SCORE, max_status=MAX_SCORE)
                     dp, stt = DB.DBconfig_query(ip_src)
                     log.warning("ANOMALY DETECTED FROM: " + ip_src + " attached with Switch ID: " + str(dp))
                     log.warning('Emergency level: ' + str(stt))
-                    if stt >= BLOCK_THRESHOLD and now < blocked_until.get(ip_src, 0):
-                        log.info("Source " + ip_src + " is already blocked")
-                    elif stt >= BLOCK_THRESHOLD:
+                    if stt >= BLOCK_THRESHOLD:
                         try:
                             OF.block_entry(dp, ip_src, time=BLOCK_SECONDS)
                             blocked_until[ip_src] = now + BLOCK_SECONDS
@@ -105,6 +117,8 @@ def initiateSpvs():
                             log.error('Error occurred when adding flow entry', exc_info=True)
                 else:
                     log.info("Normal flow: " + ip_src + " -> " + str(df.iloc[i,3]))
+            if skipped_blocked:
+                log.info("Skipped %d flows from or to blocked hosts in %s", skipped_blocked, os.path.basename(csv_file))
 
 if __name__ == "__main__":
     initiateSpvs()
